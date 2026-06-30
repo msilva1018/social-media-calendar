@@ -1,0 +1,6 @@
+streamlit>=1.40
+pandas>=2.0
+gspread>=6.0
+google-auth>=2.20
+gspread-dataframe>=4.0
+streamlit-calendar>=1.0
