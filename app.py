@@ -18,6 +18,21 @@ from streamlit_calendar import calendar
 
 from utils import data_store as ds
 
+def check_password():
+    if st.session_state.get("auth_ok"):
+        return True
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if pw == st.secrets["app_password"]:
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+    return False
+
+if not check_password():
+    st.stop()
+
 LOGO_PATH = os.path.join("assets", "logo.png")
 
 st.set_page_config(
