@@ -1,16 +1,21 @@
 """
-Data layer for the Social Media Calendar.
+Data layer for the LCN social media calendar.
 
 Backend selection is automatic:
   * If a [gcp_service_account] block exists in Streamlit secrets, posts are
-    read from / written to a Google Sheet (real, shared persistence).
-  * Otherwise the app runs in local demo mode backed by data/posts.csv so it
-    works the moment you clone it. (Note: on Streamlit Cloud the local file is
-    ephemeral — configure Google Sheets for durable storage.)
+    read from and written to a Google Sheet, which gives real shared
+    persistence.
+  * Otherwise the app runs in local mode backed by data/posts.csv so it works
+    the moment you clone it. On Streamlit Cloud that local file is ephemeral,
+    so configure Google Sheets for durable storage.
 
-The functions that touch Streamlit only read secrets / cache the client.
-The reshaping helpers (apply_edits, ensure_ids, signature, ...) are pure so
-they can be unit-tested without a running Streamlit server.
+Functions that touch Streamlit only read secrets and cache the client. The
+reshaping helpers are pure so they can be tested without a running server.
+
+SCHEMA NOTE
+This app adds Series, Persona, and Pillar to the original schema. If you are
+pointing it at an existing sheet, the new columns are created automatically the
+first time anything saves. Nothing is lost.
 """
 
 from __future__ import annotations
@@ -18,34 +23,78 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
-from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 
+from utils import seed_content
+
 # --- Schema ----------------------------------------------------------------
 
-COLUMNS = ["ID", "Date", "Time", "Platform", "Title", "Content", "Status", "Link", "Owner", "Notes"]
-
-PLATFORMS = [
-    "Instagram", "Facebook", "X (Twitter)", "LinkedIn",
-    "TikTok", "YouTube", "Threads", "Pinterest",
+COLUMNS = [
+    "ID", "Date", "Time", "Series", "Platform", "Persona", "Pillar",
+    "Title", "Content", "Status", "Owner", "Link", "Notes",
 ]
 
-STATUSES = ["Idea", "Draft", "Scheduled", "Published", "On hold"]
+# The two standing franchises, plus the opportunistic and ad hoc lanes.
+SERIES = [
+    "Atomic Essay Tuesday",
+    "Burning Budget Thursday",
+    "Observance",
+    "Competitive Signal",
+    "Other",
+]
 
-# Brand-ish colours used only to colour-code events in the calendar view.
-PLATFORM_COLORS = {
-    "Instagram": "#E1306C",
-    "Facebook": "#1877F2",
-    "X (Twitter)": "#14171A",
-    "LinkedIn": "#0A66C2",
-    "TikTok": "#FE2C55",
-    "YouTube": "#FF0000",
-    "Threads": "#3D3D3D",
-    "Pinterest": "#E60023",
+# Which weekday each franchise owns. Monday is 0, so Tuesday is 1, Thursday 3.
+SERIES_WEEKDAY = {
+    "Atomic Essay Tuesday": 1,
+    "Burning Budget Thursday": 3,
 }
-DEFAULT_COLOR = "#4F46E5"
+
+PLATFORMS = [
+    "LinkedIn personal",
+    "LinkedIn company page",
+    "Email nurture",
+    "Website insights",
+    "Short video",
+    "X (Twitter)",
+]
+
+PERSONAS = [
+    "Insights and Market Research",
+    "Competitive Intelligence",
+    "Marketing and Brand",
+    "Medical Affairs",
+    "Senior C Suite",
+    "White Label Partners",
+    "All personas",
+]
+
+PILLARS = [
+    "I Problem First",
+    "II Dimensional Insights",
+    "III Decision Ready",
+    "IV Proven and Validated",
+    "I and III",
+]
+
+STATUSES = ["Idea", "Draft", "In review", "Approved", "Scheduled", "Published", "On hold"]
+
+# LCN brand palette, taken from the logo. Used to colour code the calendar.
+NAVY = "#13294B"
+LCN_RED = "#9E1B32"
+MID_BLUE = "#4A6FA5"
+DEEP_BLUE = "#2F4F76"
+SLATE = "#8A94A6"
+
+SERIES_COLORS = {
+    "Atomic Essay Tuesday": NAVY,
+    "Burning Budget Thursday": LCN_RED,
+    "Observance": MID_BLUE,
+    "Competitive Signal": DEEP_BLUE,
+    "Other": SLATE,
+}
+DEFAULT_COLOR = SLATE
 
 LOCAL_CSV = os.path.join("data", "posts.csv")
 
@@ -68,7 +117,7 @@ def backend_name() -> str:
 def _get_worksheet():
     """Authorise with the service account and return the target worksheet.
 
-    Cached as a resource so we reuse one authorised client across reruns.
+    Cached as a resource so one authorised client is reused across reruns.
     """
     import gspread
     from google.oauth2.service_account import Credentials
@@ -88,13 +137,13 @@ def _get_worksheet():
     elif cfg.get("spreadsheet_url"):
         sh = client.open_by_url(cfg["spreadsheet_url"])
     else:
-        sh = client.open(cfg.get("spreadsheet_name", "Social Media Calendar"))
+        sh = client.open(cfg.get("spreadsheet_name", "LCN Social Media Calendar"))
 
     ws_name = cfg.get("worksheet_name", "Posts")
     try:
         ws = sh.worksheet(ws_name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=ws_name, rows=200, cols=len(COLUMNS))
+        ws = sh.add_worksheet(title=ws_name, rows=400, cols=len(COLUMNS))
         ws.update([COLUMNS])
     return ws
 
@@ -102,7 +151,11 @@ def _get_worksheet():
 # --- Pure helpers (safe to unit test) --------------------------------------
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """Force the frame onto the canonical schema with sensible dtypes."""
+    """Force the frame onto the canonical schema with sensible dtypes.
+
+    Reindexing on COLUMNS is what makes a schema change non destructive: any
+    column the sheet does not have yet simply arrives empty.
+    """
     df = df.reindex(columns=COLUMNS)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     for col in COLUMNS:
@@ -120,7 +173,7 @@ def ensure_ids(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def signature(df: pd.DataFrame) -> str:
-    """Order-stable content hash, used to detect unsaved changes."""
+    """Order stable content hash, used to detect unsaved changes."""
     tmp = df.copy().reindex(columns=COLUMNS)
     tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     tmp = tmp.fillna("").astype(str)
@@ -128,9 +181,9 @@ def signature(df: pd.DataFrame) -> str:
 
 
 def apply_edits(full_df: pd.DataFrame, edited_view: pd.DataFrame) -> pd.DataFrame:
-    """Merge cell edits made on a (possibly filtered) view back into the full
-    dataset, matching rows by ID. The editor uses fixed rows, so this only
-    handles edits — additions and deletions are done elsewhere."""
+    """Merge cell edits made on a possibly filtered view back into the full
+    dataset, matching rows by ID. The editor uses fixed rows, so this handles
+    edits only. Additions and deletions happen elsewhere."""
     if edited_view is None or edited_view.empty:
         return full_df
     result = full_df.copy()
@@ -138,14 +191,47 @@ def apply_edits(full_df: pd.DataFrame, edited_view: pd.DataFrame) -> pd.DataFram
     ev = edited_view.copy()
     ev.index = ev["ID"].astype(str)
     cols = [c for c in COLUMNS if c != "ID"]
+    cols = [c for c in cols if c in ev.columns]
     common = result.index.intersection(ev.index)
     if len(common):
         result.loc[common, cols] = ev.loc[common, cols]
     return result.reset_index(drop=True)
 
 
+def cadence_conflicts(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows where a franchise post is not on the weekday it owns.
+
+    Atomic Essay belongs on Tuesday, Burning Budget on Thursday. Drifting off
+    those days is the most common way a publishing cadence quietly dies, so the
+    app surfaces it rather than waiting for someone to notice.
+    """
+    dates = pd.to_datetime(df["Date"], errors="coerce")
+    flags = []
+    for i, row in df.iterrows():
+        want = SERIES_WEEKDAY.get(row.get("Series", ""))
+        if want is None or pd.isna(dates.iloc[i]):
+            continue
+        if dates.iloc[i].weekday() != want:
+            flags.append(i)
+    return df.loc[flags].reset_index(drop=True)
+
+
+def missing_slots(df: pd.DataFrame, start, end) -> list[dict]:
+    """Tuesdays with no Atomic Essay and Thursdays with no Burning Budget."""
+    dates = pd.to_datetime(df["Date"], errors="coerce")
+    gaps = []
+    for series, weekday in SERIES_WEEKDAY.items():
+        taken = set(
+            dates[(df["Series"] == series) & dates.notna()].dt.date.tolist()
+        )
+        for day in pd.date_range(start, end, freq="D"):
+            if day.weekday() == weekday and day.date() not in taken:
+                gaps.append({"Date": day.date(), "Series": series})
+    return sorted(gaps, key=lambda g: (g["Date"], g["Series"]))
+
+
 def to_events(df: pd.DataFrame) -> list[dict]:
-    """Turn rows into FullCalendar event dicts for the calendar view."""
+    """Turn rows into FullCalendar event dicts, coloured by Series."""
     events = []
     for _, r in df.iterrows():
         if pd.isna(r["Date"]):
@@ -154,39 +240,28 @@ def to_events(df: pd.DataFrame) -> list[dict]:
         time = str(r.get("Time", "")).strip()
         start = f"{day}T{time}" if time and ":" in time else day
         label = str(r["Title"]).strip() or str(r["Content"]).strip()[:32] or "(untitled)"
+        colour = SERIES_COLORS.get(str(r.get("Series", "")), DEFAULT_COLOR)
+        held = str(r.get("Status", "")).strip() in {"On hold", "Idea"}
         events.append(
             {
                 "id": str(r["ID"]),
-                "title": f"{r['Platform']} · {label}" if r["Platform"] else label,
+                "title": label,
                 "start": start,
                 "allDay": not (time and ":" in time),
-                "backgroundColor": PLATFORM_COLORS.get(r["Platform"], DEFAULT_COLOR),
-                "borderColor": PLATFORM_COLORS.get(r["Platform"], DEFAULT_COLOR),
+                "backgroundColor": colour,
+                "borderColor": colour,
                 "textColor": "#FFFFFF",
+                # Held rows read as provisional rather than committed.
+                "classNames": ["lcn-held"] if held else [],
             }
         )
     return events
 
 
-def sample_data() -> pd.DataFrame:
-    """A small, today-relative seed so the calendar looks alive on first run."""
-    today = date.today()
-
-    def d(offset):
-        return pd.Timestamp(today + timedelta(days=offset))
-
-    rows = [
-        [d(-3), "09:00", "Instagram", "Behind the scenes", "A peek at how we build things this week. #buildinpublic", "Published", "", "Maya", ""],
-        [d(-1), "12:30", "LinkedIn", "Founder note", "Why we started — three lessons from year one.", "Published", "", "Sam", ""],
-        [d(0), "08:00", "X (Twitter)", "Launch teaser", "Something new drops Friday. Any guesses? 👀", "Scheduled", "", "Maya", "Pin to top"],
-        [d(1), "17:00", "TikTok", "Quick tip", "60-second tutorial: getting started in under a minute.", "Draft", "", "Lee", "Need to film"],
-        [d(2), "10:00", "Facebook", "Customer story", "How @client cut their workflow in half.", "Scheduled", "", "Sam", ""],
-        [d(4), "11:00", "Instagram", "Product reel", "New feature walkthrough, set to music.", "Draft", "", "Lee", "Awaiting assets"],
-        [d(7), "09:30", "YouTube", "Deep dive", "Full 10-minute explainer on the new release.", "Idea", "", "Maya", ""],
-        [d(9), "15:00", "LinkedIn", "Hiring post", "We're growing — two roles open on the team.", "Idea", "", "Sam", ""],
-        [d(14), "13:00", "Pinterest", "Inspiration board", "Seasonal mood board for the spring campaign.", "Idea", "", "Lee", ""],
-    ]
-    df = pd.DataFrame(rows, columns=[c for c in COLUMNS if c != "ID"])
+def seed_data() -> pd.DataFrame:
+    """The LCN August and September 2026 calendar as shipped."""
+    rows = seed_content.all_rows()
+    df = pd.DataFrame(rows)
     df.insert(0, "ID", [uuid.uuid4().hex[:8] for _ in range(len(df))])
     return _normalize(df)
 
@@ -194,27 +269,30 @@ def sample_data() -> pd.DataFrame:
 # --- Public load / save ----------------------------------------------------
 
 def load_data() -> pd.DataFrame:
-    """Load posts from the active backend, seeding demo data on first local run."""
+    """Load posts from the active backend, seeding the LCN calendar on first run."""
     if using_sheets():
         from gspread_dataframe import get_as_dataframe
 
         ws = _get_worksheet()
         df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
         df = df.dropna(how="all")
+        if df.empty:
+            df = seed_data()
+            save_data(df)
+            return df
         return ensure_ids(_normalize(df))
 
     if os.path.exists(LOCAL_CSV):
         df = pd.read_csv(LOCAL_CSV)
         return ensure_ids(_normalize(df))
 
-    # First local run: seed sample data and persist it.
-    df = sample_data()
+    df = seed_data()
     save_data(df)
     return df
 
 
 def save_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Persist the full dataset. Returns the saved frame (with IDs filled in)."""
+    """Persist the full dataset. Returns the saved frame with IDs filled in."""
     df = ensure_ids(_normalize(df))
     out = df.copy()
     out["Date"] = out["Date"].dt.strftime("%Y-%m-%d").fillna("")
